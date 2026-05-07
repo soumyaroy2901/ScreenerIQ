@@ -398,7 +398,9 @@ def main():
                 con_df = con_df.rename(columns={'screener_name': 'screeners'})
                 display_cols.append('screeners')
             
-            st.dataframe(con_df.head(30)[display_cols], use_container_width=True, height=600, hide_index=True)
+            # st.dataframe(con_df.head(30)[display_cols], use_container_width=True, height=600, hide_index=True)
+            st.dataframe(con_df[con_df['repetition_count'] >= 4][display_cols], use_container_width=True, height=600, hide_index=True)
+
 
     # --- PAGE: PERFORMANCE ANALYTICS ---
     elif page == "Performance Analytics":
