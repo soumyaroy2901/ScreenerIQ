@@ -514,12 +514,25 @@ def main():
         st.title("⚙️ System Settings")
         st.write(f"App Directory: `{APP_DIR}`")
         st.write(f"History File: `{HISTORY_FILE}`")
+        # Download Button for History File
+        history_path = "/mount/src/screeneriq/history.json" # Your specified path
         
-        if st.button("🗑️ Clear History"):
-            if os.path.exists(HISTORY_FILE):
-                os.remove(HISTORY_FILE)
-                st.success("History cleared.")
-                st.rerun()
+        if os.path.exists(history_path):
+            with open(history_path, "rb") as f:
+                st.download_button(
+                    label="📥 Download History JSON",
+                    data=f,
+                    file_name="history.json",
+                    mime="application/json"
+                )
+        else:
+            st.info("Note: history.json not found at the specified path.")
+        
+        # if st.button("🗑️ Clear History"):
+        #     if os.path.exists(HISTORY_FILE):
+        #         os.remove(HISTORY_FILE)
+        #         st.success("History cleared.")
+        #         st.rerun()
 
 if __name__ == "__main__":
     main()
