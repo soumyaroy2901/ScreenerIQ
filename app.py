@@ -5,18 +5,62 @@ from bs4 import BeautifulSoup
 import time
 import re
 import html
-import json
+from database import DatabaseManager
 import os
 from datetime import datetime, timedelta
 import pytz
 import plotly.express as px
 import plotly.graph_objects as go
+import json
+
+# Fix pandas future warning
+pd.set_option('future.no_silent_downcasting', True)
+
 
 # --- CONFIGURATION ---
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-HISTORY_FILE = os.path.join(APP_DIR, "history.json")
+DB_FILE = os.path.join(APP_DIR, "history.db")
 DEFAULT_EXCEL = os.path.join(APP_DIR, "StocksScreener.xlsx")
 IST = pytz.timezone('Asia/Kolkata')
+
+# --- NSE HOLIDAYS 2026 ---
+NSE_HOLIDAYS_2026 = [
+    "2026-01-26", # Republic Day
+    "2026-03-03", # Holi
+    "2026-03-26", # Ram Navami
+    "2026-03-31", # Mahavir Jayanti
+    "2026-04-03", # Good Friday
+    "2026-04-14", # Ambedkar Jayanti
+    "2026-05-01", # Maharashtra Day
+    "2026-05-28", # Bakri Id
+    "2026-06-26", # Muharram
+    "2026-09-14", # Ganesh Chaturthi
+    "2026-10-02", # Gandhi Jayanti
+    "2026-10-20", # Dasara
+    "2026-11-10", # Diwali
+    "2026-11-24", # Guru Nanak Jayanti
+    "2026-12-25", # Christmas
+]
+
+def is_trading_day(dt):
+    # Weekends (Saturday=5, Sunday=6)
+    if dt.weekday() >= 5:
+        return False
+    # Holidays
+    date_str = dt.strftime("%Y-%m-%d")
+    if date_str in NSE_HOLIDAYS_2026:
+        return False
+    return True
+
+def get_last_trading_day(dt):
+    curr = dt - timedelta(days=1)
+    while not is_trading_day(curr):
+        curr -= timedelta(days=1)
+    return curr
+
+# Initialize Database
+db = DatabaseManager(DB_FILE)
+
 
 # --- CSS STYLING ---
 def apply_custom_styles():
@@ -95,22 +139,24 @@ def apply_custom_styles():
     """, unsafe_allow_html=True)
 
 # --- PREDICTION SUCCESS LOGIC ---
-def calculate_prediction_success(history, today_str):
-    dates = sorted(history.keys())
-    if len(dates) < 2:
+def calculate_prediction_success(today_str):
+    all_dates = db.get_all_dates() # Returns sorted dates DESC
+    if len(all_dates) < 2:
         return None, None
     
-    # Find the previous date
+    # Find the previous date relative to today_str
     try:
-        current_idx = dates.index(today_str)
-        if current_idx == 0: return None, None
-        prev_date = dates[current_idx - 1]
+        current_idx = all_dates.index(today_str)
+        if current_idx == len(all_dates) - 1: return None, None # No earlier date
+        prev_date = all_dates[current_idx + 1]
     except ValueError:
-        prev_date = dates[-1] if dates else None
+        # today_str not in DB yet (maybe running analysis right now)
+        prev_date = all_dates[0] if all_dates else None
         if not prev_date or prev_date == today_str: return None, None
 
-    prev_con = pd.DataFrame(history[prev_date]['consensus'])
-    today_con = pd.DataFrame(history[today_str]['consensus'])
+    prev_con, _ = db.get_daily_data(prev_date)
+    today_con, _ = db.get_daily_data(today_str)
+
     
     if prev_con.empty or today_con.empty:
         return None, None
@@ -159,81 +205,46 @@ def calculate_prediction_success(history, today_str):
     
     return success_report, prev_date
 
-def calculate_historical_success(history):
-    dates = sorted(history.keys())
-    if len(dates) < 2:
+def calculate_historical_success():
+    return calculate_all_time_prediction_success()
+
+def calculate_all_time_prediction_success():
+    all_dates = db.get_all_dates() # Sorted DESC
+    if len(all_dates) < 2:
+        return None
+    
+    all_reports = []
+    # all_dates is [D_now, D_prev, D_prev_prev, ...]
+    for i in range(len(all_dates) - 1):
+        target_date = all_dates[i]
+        report, _ = calculate_prediction_success(target_date)
+        if report is not None:
+            all_reports.append(report.reset_index())
+            
+    if not all_reports:
         return None
         
-    all_pairs_results = []
+    combined = pd.concat(all_reports)
+    combined['weighted_return'] = combined['avg_realized_return'] * combined['pick_count']
+    combined['weighted_success'] = combined['success_rate'] * combined['pick_count']
     
-    for i in range(len(dates) - 1):
-        d1 = dates[i]
-        d2 = dates[i+1]
-        
-        d1_con = pd.DataFrame(history[d1]['consensus'])
-        d2_con = pd.DataFrame(history[d2]['consensus'])
-        
-        if d1_con.empty or d2_con.empty: continue
-            
-        # Match stocks by symbol
-        sc_col = 'screeners' if 'screeners' in d1_con.columns else 'screener_name'
-        if sc_col not in d1_con.columns: continue
-            
-        merged = pd.merge(
-            d1_con[['nsecode', 'close', sc_col]], 
-            d2_con[['nsecode', 'close']], 
-            on='nsecode', 
-            suffixes=('_prev', '_today')
-        )
-        
-        if merged.empty: continue
-            
-        merged['realized_return'] = (merged['close_today'] / merged['close_prev'] - 1) * 100
-        merged['is_success'] = merged['realized_return'] > 0
-        
-        for _, row in merged.iterrows():
-            sc_list = str(row[sc_col]).split(', ')
-            for sc in sc_list:
-                all_pairs_results.append({
-                    "Screener": sc,
-                    "Return": row['realized_return'],
-                    "Success": 1 if row['is_success'] else 0
-                })
-                
-    if not all_pairs_results:
-        return None
-        
-    df = pd.DataFrame(all_pairs_results)
-    historical_leaderboard = df.groupby('Screener').agg(
-        avg_success_rate=('Success', 'mean'),
-        avg_realized_return=('Return', 'mean'),
-        total_picks=('Success', 'count')
-    ).sort_values(['avg_success_rate', 'avg_realized_return'], ascending=False)
-    
-    return historical_leaderboard
+    final = combined.groupby('Screener').agg(
+        total_return=('weighted_return', 'sum'),
+        total_success=('weighted_success', 'sum'),
+        total_picks=('pick_count', 'sum')
+    )
+    final['avg_realized_return'] = final['total_return'] / final['total_picks']
+    final['avg_success_rate'] = final['total_success'] / final['total_picks']
+    return final.sort_values('avg_success_rate', ascending=False).reset_index()
+
 
 # --- UTILITIES ---
 def get_current_ist_time():
     return datetime.now(IST)
 
-def load_history():
-    if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, 'r') as f:
-            try:
-                return json.load(f)
-            except:
-                return {}
-    return {}
-
 def save_to_history(date_str, consensus_df, screener_perf):
-    history = load_history()
-    history[date_str] = {
-        "consensus": consensus_df.to_dict(orient='records'),
-        "performance": screener_perf.to_dict(orient='records'),
-        "timestamp": datetime.now().isoformat()
-    }
-    with open(HISTORY_FILE, 'w') as f:
-        json.dump(history, f, indent=4)
+    db.save_daily_report(date_str, consensus_df, screener_perf)
+
 
 def extract_scan_clause(url, session):
     try:
@@ -244,9 +255,13 @@ def extract_scan_clause(url, session):
         if match:
             json_str = html.unescape(match.group(1))
             scan_data = json.loads(json_str)
-            return scan_data.get('atlas_query', '').strip()
+            # Try multiple common keys for resilience
+            for key in ['atlas_query', 'scan_clause', 'query']:
+                val = scan_data.get(key)
+                if val: return val.strip()
         return None
-    except Exception:
+    except Exception as e:
+        st.error(f"⚠️ Failed to parse screener logic for {url}: {e}")
         return None
 
 # --- CORE ANALYSIS ENGINE ---
@@ -314,83 +329,152 @@ def run_full_analysis(df_input):
     for _, row in master_df.iterrows():
         screener_rows.append({
             "Screener": row['screener_name'],
-            "Change %": row['per_chg']
+            "Change %": row['per_chg'],
+            "Is Positive": 1 if row['per_chg'] > 0 else 0
         })
     perf_df = pd.DataFrame(screener_rows)
-    screener_perf = perf_df.groupby('Screener')['Change %'].agg(['mean', 'count']).reset_index()
-    screener_perf = screener_perf.sort_values(by='mean', ascending=False)
+    screener_perf = perf_df.groupby('Screener').agg(
+        mean=('Change %', 'mean'),
+        count=('Change %', 'count'),
+        success_rate=('Is Positive', 'mean')
+    ).reset_index()
 
     return consensus_df, screener_perf, None
+
 
 # --- STREAMLIT UI ---
 def main():
     st.set_page_config(page_title="Commander Desk v5", page_icon="📡", layout="wide")
+    def get_last_trading_day():
+        now = datetime.now(IST)
+        today_str = now.strftime('%Y-%m-%d')
+        today_weekday = now.weekday() # 0=Mon, 6=Sun
+        
+        is_trading_day = (today_weekday < 5) and (today_str not in NSE_HOLIDAYS_2026)
+        
+        # Time check (9:15 AM to 3:30 PM)
+        market_open_time = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        is_market_open = is_trading_day and (market_open_time <= now <= market_close_time)
+
+        # Get last trading day by looking backwards
+        search_date = now - timedelta(days=1)
+        while True:
+            sw = search_date.weekday()
+            sd_str = search_date.strftime('%Y-%m-%d')
+            if sw < 5 and sd_str not in NSE_HOLIDAYS_2026:
+                last_day_str = sd_str
+                break
+            search_date -= timedelta(days=1)
+            
+        # If today is a trading day and it's after market close, today is the primary display date
+        if is_trading_day and now.time() >= datetime.strptime("15:30", "%H:%M").time():
+            return True, is_market_open, today_str, today_str, last_day_str
+        
+        return is_trading_day, is_market_open, last_day_str, today_str, last_day_str
+    
     apply_custom_styles()
     
     now = get_current_ist_time()
     today_str = now.strftime("%Y-%m-%d")
-    history = load_history()
+    all_dates = db.get_all_dates()
+    
+    is_trading_day, is_market_open, last_trading_day_str, today_str, _ = get_last_trading_day()
     
     # --- SIDEBAR ---
     st.sidebar.title("📡 CONTROL CENTER")
     st.sidebar.info(f"IST: {now.strftime('%H:%M:%S')}")
     
-    analysis_status = "READY" if today_str in history else "PENDING"
-    status_color = "status-ready" if analysis_status == "READY" else "status-pending"
-    st.sidebar.markdown(f"Status: <span class='{status_color}'>{analysis_status}</span>", unsafe_allow_html=True)
-    
+    # Sidebar Market Status
+    if is_market_open:
+        st.sidebar.success("🟢 MARKET OPEN")
+    else:
+        st.sidebar.error("🔴 MARKET CLOSED")
+
+    if today_str in all_dates:
+        analysis_status = "READY"
+        status_color = "status-ready"
+    elif not is_trading_day:
+        analysis_status = "NSE HOLIDAY / WEEKEND"
+        status_color = "status-pending"
+    else:
+        analysis_status = "PENDING"
+        status_color = "status-pending"
+
+    st.sidebar.markdown(f"Analysis: <span class='{status_color}'>{analysis_status}</span>", unsafe_allow_html=True)
     auto_trigger = st.sidebar.checkbox("Auto-Trigger Analysis at 5 PM", value=True)
+
     
-    # Check for Auto-Trigger
-    if auto_trigger and analysis_status == "PENDING" and now.hour >= 17:
-        st.sidebar.warning("🕒 It's past 5 PM IST. Auto-triggering analysis...")
-        if os.path.exists(DEFAULT_EXCEL):
-            df_input = pd.read_excel(DEFAULT_EXCEL)
-            con_df, perf_df, err = run_full_analysis(df_input)
-            if not err:
-                save_to_history(today_str, con_df, perf_df)
-                st.rerun()
-            else:
-                st.sidebar.error(err)
+    # Check for Auto-Trigger (Double-lock to prevent race conditions across tabs)
+    if auto_trigger and is_trading_day and analysis_status == "PENDING" and now.hour >= 17:
+        # Re-verify status from DB to ensure another tab didn't just finish it
+        if today_str not in db.get_all_dates():
+            st.sidebar.warning("🕒 It's past 5 PM IST. Auto-triggering analysis...")
+            try:
+                if os.path.exists(DEFAULT_EXCEL):
+                    df_input = pd.read_excel(DEFAULT_EXCEL)
+                    # Deduplicate screeners if any
+                    df_input = df_input.drop_duplicates(subset=['url'])
+                    
+                    con_df, perf_df, err = run_full_analysis(df_input)
+                    if not err:
+                        save_date = today_str if is_trading_day else last_trading_day_str
+                        db.save_daily_report(save_date, con_df, perf_df)
+                        st.rerun()
+                    else:
+                        st.sidebar.error(err)
+                else:
+                    st.sidebar.error("❌ StocksScreener.xlsx not found.")
+            except Exception as e:
+                st.sidebar.error(f"❌ Analysis failed: {e}")
 
     st.sidebar.divider()
-    page = st.sidebar.radio("Navigate", ["Command Desk", "Performance Analytics", "Historical Trends", "Strategy Synergy", "Settings"])
+    page = st.sidebar.radio("Navigate", ["Command Desk", "Performance Analytics", "Historical Trends", "Settings"])
     
     # --- PAGE: COMMAND DESK ---
     if page == "Command Desk":
         st.title("📡 Commander Desk - Daily Pulse")
         
-        if today_str not in history:
-            st.info("👋 No analysis found for today. Run it manually or wait for the 5 PM auto-trigger.")
-            if st.button("🚀 Run Manual Analysis"):
-                if os.path.exists(DEFAULT_EXCEL):
-                    df_input = pd.read_excel(DEFAULT_EXCEL)
-                    con_df, perf_df, err = run_full_analysis(df_input)
-                    if not err:
-                        save_to_history(today_str, con_df, perf_df)
-                        st.success("Analysis complete and stored!")
-                        st.rerun()
-                    else:
-                        st.error(err)
+        display_date = today_str
+        is_fallback = False
+        
+        if today_str not in all_dates:
+            if all_dates:
+                display_date = all_dates[0]
+                is_fallback = True
+                if not is_trading_day:
+                    if last_trading_day_str not in all_dates:
+                        st.warning(f"⚠️ Missing data for the last trading day (**{last_trading_day_str}**). Run analysis now to capture results.")
+                    st.info(f"🏖️ Market is closed today ({today_str}). Showing latest available data from **{display_date}**.")
                 else:
-                    st.error("Missing StocksScreener.xlsx")
-        else:
-            data = history[today_str]
-            con_df = pd.DataFrame(data['consensus'])
-            perf_df = pd.DataFrame(data['performance'])
-            
-            # Prediction Success Calculation
-            success_report, prev_date = calculate_prediction_success(history, today_str)
+                    st.info(f"📌 Today ({today_str}) is not yet analyzed. Showing latest available data from **{display_date}**.")
+            else:
+                st.info("👋 No analysis history found. Analysis is automated daily at 5 PM IST.")
+                st.stop() # Stop here if no data at all
+        
+        # Fetch data for display_date
+        con_df, perf_df = db.get_daily_data(display_date)
+        
+        # Sort performance for metrics
+        if not perf_df.empty:
+            perf_df = perf_df.sort_values('mean', ascending=False)
+        
+        if not con_df.empty:
+            # Prediction Success Calculation (How yesterday's picks did on display_date)
+            success_report, prev_date = calculate_prediction_success(display_date)
+
+
             overall_success_rate = success_report['success_rate'].mean() * 100 if success_report is not None else 0
             
             # Metrics
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Top Conviction", con_df.iloc[0]['nsecode'], f"{con_df.iloc[0]['repetition_count']} Hits")
-            m2.metric("Best Strategy", perf_df.iloc[0]['Screener'], f"{perf_df.iloc[0]['mean']:.2f}% Today")
+            m1.metric("Top Conviction", con_df.iloc[0]['nsecode'] if not con_df.empty else "N/A", f"{con_df.iloc[0]['repetition_count']} Hits" if not con_df.empty else "0 Hits")
+            m2.metric("Best Strategy", perf_df.iloc[0]['Screener'] if not perf_df.empty else "N/A", f"{perf_df.iloc[0]['mean']:.2f}% Today" if not perf_df.empty else "0.00% Today")
             m3.metric("Prediction Success", f"{overall_success_rate:.1f}%", f"vs {prev_date}" if prev_date else "No History")
             m4.metric("Market Sentiment", "Bullish" if con_df['per_chg'].mean() > 0 else "Bearish", f"{con_df['per_chg'].mean():.2f}% Avg")
+
             
-            st.subheader("🔥 High Conviction Consensus (Today)")
+            st.subheader(f"🔥 High Conviction Consensus ({display_date})")
             # Resilient column selection
             display_cols = ['nsecode', 'name', 'repetition_count', 'close', 'per_chg']
             if 'screeners' in con_df.columns: display_cols.append('screeners')
@@ -398,18 +482,20 @@ def main():
                 con_df = con_df.rename(columns={'screener_name': 'screeners'})
                 display_cols.append('screeners')
             
-            # st.dataframe(con_df.head(30)[display_cols], use_container_width=True, height=600, hide_index=True)
-            st.dataframe(con_df[con_df['repetition_count'] >= 4][display_cols], use_container_width=True, height=600, hide_index=True)
+            filtered_con = con_df[con_df['repetition_count'] >= 3]
+            st.dataframe(filtered_con[display_cols], width='stretch', height=600, hide_index=True)
 
-
-    # --- PAGE: PERFORMANCE ANALYTICS ---
     elif page == "Performance Analytics":
         st.title("🎯 Strategy Performance Center")
-        if today_str not in history:
-            st.warning("Run today's analysis to see performance data.")
+        
+        display_date = today_str if today_str in all_dates else (all_dates[0] if all_dates else None)
+        
+        if not display_date:
+            st.warning("No analysis history found. Run a scan to generate performance data.")
         else:
-            success_report, prev_date = calculate_prediction_success(history, today_str)
-            historical_report = calculate_historical_success(history)
+            success_report, prev_date = calculate_prediction_success(display_date)
+            historical_report = calculate_historical_success()
+
 
             with st.expander("ℹ️ Understanding Performance Metrics", expanded=False):
                 st.markdown("""
@@ -423,116 +509,145 @@ def main():
             with col_a:
                 st.subheader(f"📅 Daily Success Pulse (Vs {prev_date})")
                 if success_report is not None:
-                    # Format
-                    disp_daily = success_report.copy()
-                    disp_daily['success_rate'] = (disp_daily['success_rate'] * 100).map('{:.1f}%'.format)
-                    disp_daily['avg_realized_return'] = disp_daily['avg_realized_return'].map('{:.2f}%'.format)
-                    st.dataframe(disp_daily[['success_rate', 'avg_realized_return', 'pick_count']], use_container_width=True, height=500)
+                    # Keep numeric for sorting, use column_config for display
+                    disp_daily = success_report.reset_index()
+                    disp_daily['success_rate'] = disp_daily['success_rate'] * 100
+                    
+                    st.dataframe(
+                        disp_daily, 
+                        use_container_width=True,
+                        column_config={
+                            "success_rate": st.column_config.NumberColumn("Success Rate", format="%.1f%%"),
+                            "avg_realized_return": st.column_config.NumberColumn("Avg Return", format="%.2f%%"),
+                            "pick_count": st.column_config.NumberColumn("Picks")
+                        },
+                        hide_index=True
+                    )
+
                 else:
                     st.info("Daily success analysis requires at least 2 consecutive days of data.")
             
             with col_b:
-                st.subheader("🏛️ All-Time Strategic Leaderboard")
-                if historical_report is not None:
-                    # Format
+                st.subheader("🏛️ Strategic Leaderboard (Next-Day)")
+                if historical_report is not None and not historical_report.empty:
+                    st.caption(f"Note: Picks from {today_str} are PENDING Monday's results.")
+                    # Keep numeric for sorting
                     disp_hist = historical_report.copy()
-                    disp_hist['avg_success_rate'] = (disp_hist['avg_success_rate'] * 100).map('{:.1f}%'.format)
-                    disp_hist['avg_realized_return'] = disp_hist['avg_realized_return'].map('{:.2f}%'.format)
-                    st.dataframe(disp_hist[['avg_success_rate', 'avg_realized_return', 'total_picks']], use_container_width=True, height=500)
+                    disp_hist['avg_success_rate'] = disp_hist['avg_success_rate'] * 100
+                    
+                    st.dataframe(
+                        disp_hist, 
+                        use_container_width=True,
+                        column_config={
+                            "avg_success_rate": st.column_config.NumberColumn("Historical Success", format="%.1f%%"),
+                            "avg_realized_return": st.column_config.NumberColumn("Avg Return", format="%.2f%%"),
+                            "total_picks": st.column_config.NumberColumn("Total Picks")
+                        },
+                        hide_index=True
+                    )
+
                 else:
                     st.info("Historical analysis builds up as you store more daily reports.")
+
 
     # --- PAGE: HISTORICAL TRENDS ---
     elif page == "Historical Trends":
         st.title("📈 Strategic Intelligence - History")
-        if not history:
+        
+        historical_report = calculate_historical_success()
+        
+        if historical_report is not None and not historical_report.empty:
+            st.subheader("🏛️ Historical Prediction Leaderboard (Next-Day)")
+            st.caption(f"Aggregated performance across {len(all_dates)-1} historical trading sessions.")
+            # Format and show top 10 historical
+            disp_hist = historical_report.head(10).copy()
+            disp_hist['avg_realized_return_val'] = disp_hist['avg_realized_return'] # Keep numeric for chart
+            
+            fig = px.bar(disp_hist, x='avg_realized_return', y='Screener', orientation='h', 
+                         title="Top 10 Screeners by Historical Avg Return",
+                         color='avg_realized_return', color_continuous_scale='Greens')
+            st.plotly_chart(fig, use_container_width=True)
+        
+        st.divider()
+        if not all_dates:
             st.warning("No historical data found.")
         else:
-            dates = sorted(history.keys(), reverse=True)
-            selected_date = st.selectbox("Select Date", dates)
+            st.subheader("🔍 Daily Snapshot Lookup")
+            selected_date = st.selectbox("Select Date to View Details", all_dates)
+            con_df, perf_df = db.get_daily_data(selected_date)
             
-            day_data = history[selected_date]
-            perf_df = pd.DataFrame(day_data['performance'])
-            
-            st.write(f"Showing performance for: {selected_date}")
-            fig = px.bar(perf_df.head(10), x='mean', y='Screener', orientation='h', 
-                         title="Top 10 Screeners by Average Return",
-                         color='mean', color_continuous_scale='Greens')
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Cumulative performance of a strategy over time
-            st.divider()
-            st.subheader("Consistency Tracker")
-            all_perf_data = []
-            for d in history:
-                d_perf = pd.DataFrame(history[d]['performance'])
-                d_perf['Date'] = d
-                all_perf_data.append(d_perf)
-            
-            big_perf = pd.concat(all_perf_data)
-            all_strategies = sorted(big_perf['Screener'].unique())
-            target_strategy = st.selectbox("Pick a Strategy to Track", all_strategies)
-            
-            strat_trend = big_perf[big_perf['Screener'] == target_strategy].sort_values('Date')
-            fig2 = px.line(strat_trend, x='Date', y='mean', markers=True, title=f"Performance Trend: {target_strategy}")
-            st.plotly_chart(fig2, use_container_width=True)
+            if not perf_df.empty:
+                st.write(f"Showing performance for: {selected_date}")
+                # Daily performance chart
+                fig_daily = px.bar(perf_df.sort_values('mean', ascending=False).head(10), 
+                                  x='mean', y='Screener', orientation='h',
+                                  title=f"Daily Leaders ({selected_date})",
+                                  color='mean', color_continuous_scale='Blues')
+                st.plotly_chart(fig_daily, use_container_width=True)
 
-    # --- PAGE: STRATEGY SYNERGY ---
-    elif page == "Strategy Synergy":
-        st.title("🧬 Strategy Synergy Analysis")
-        if not history:
-            st.warning("No data found. Run an analysis to see synergy data.")
-        else:
-            dates = sorted(history.keys(), reverse=True)
-            selected_date = st.selectbox("Select Date for Synergy Analysis", dates, key="synergy_date")
+            # Bug 1: Consistency Tracker (Multi-line)
+            st.divider()
+            st.subheader("🧬 Multi-Strategy Consistency Tracker")
             
-            data = history[selected_date]
-            con_df = pd.DataFrame(data['consensus'])
+            with db._get_connection() as conn:
+                big_perf = pd.read_sql("SELECT * FROM daily_performance", conn)
+                big_perf = big_perf.rename(columns={'screener': 'Screener', 'mean_return': 'mean', 'date': 'Date'})
+
+            all_strategies = sorted(big_perf['Screener'].unique())
+            # Default to top 5 historical strategies
+            default_strats = historical_report.head(5)['Screener'].tolist() if historical_report is not None else []
             
-            # Analyze combinations
-            sc_col = 'screeners' if 'screeners' in con_df.columns else 'screener_name'
+            target_strategies = st.multiselect("Pick Strategies to Compare Trend", all_strategies, default=default_strats)
             
-            if sc_col in con_df.columns:
-                con_df['screener_list'] = con_df[sc_col].astype(str).str.split(', ')
-                con_df['combo'] = con_df['screener_list'].apply(lambda x: " + ".join(sorted(x)) if len(x) > 1 else "Single Signal")
-                
-                synergy = con_df.groupby('combo')['per_chg'].agg(['mean', 'count']).sort_values('mean', ascending=False)
-                synergy = synergy[synergy['count'] > 1]
-                
-                st.subheader(f"Top Multi-Signal Combinations ({selected_date})")
-                st.dataframe(synergy, use_container_width=True)
-                
-                fig = px.scatter(con_df, x='repetition_count', y='per_chg', hover_name='nsecode', 
-                                size='repetition_count', color='per_chg',
-                                title=f"Signal Count vs. Price Performance ({selected_date})")
-                st.plotly_chart(fig, use_container_width=True)
+            if target_strategies:
+                strat_trend = big_perf[big_perf['Screener'].isin(target_strategies)].sort_values('Date')
+                fig2 = px.line(strat_trend, x='Date', y='mean', color='Screener', markers=True, 
+                              title="Strategy Performance Consistency Over Time")
+                st.plotly_chart(fig2, use_container_width=True)
             else:
-                st.error("Screener data missing in history for this date.")
+                st.info("Select one or more strategies above to see the trend graph.")
+
 
     # --- PAGE: SETTINGS ---
     elif page == "Settings":
         st.title("⚙️ System Settings")
+        
+        st.subheader("🛠️ Administrative Actions")
+        with st.expander("Run Manual Analysis"):
+            admin_pwd = st.text_input("Admin Password", type="password", key="admin_pwd")
+            if admin_pwd == "Trade@123":
+                st.divider()
+                if st.button("🚀 Trigger Full Analysis"):
+                    # Vault Protection Check
+                    if is_trading_day and now.time() < datetime.strptime("15:30", "%H:%M").time():
+                        st.error("🛑 Vault Protection: You cannot save analysis to the database during live market hours (before 15:30 IST). This prevents intraday noise from corrupting your historical intelligence.")
+                    elif os.path.exists(DEFAULT_EXCEL):
+                        with st.spinner("Executing manual scan..."):
+                            df_input = pd.read_excel(DEFAULT_EXCEL)
+                            con_df, perf_df, err = run_full_analysis(df_input)
+                            if not err:
+                                t_day, l_day, t_str, l_str = get_last_trading_day()
+                                save_date = t_str if t_day else l_str
+                                db.save_daily_report(save_date, con_df, perf_df)
+                                st.success(f"Analysis complete and stored for {save_date}!")
+                                st.rerun()
+                            else:
+                                st.error(err)
+                    else:
+                        st.error("Missing StocksScreener.xlsx")
+                
+                if st.button("🗑️ Clear History Database"):
+                    db.clear_all_history()
+                    st.success("History cleared.")
+                    st.rerun()
+            elif admin_pwd:
+                st.error("Access Denied: Incorrect Password")
+
+        st.divider()
+        st.subheader("📂 Data Vault Information")
         st.write(f"App Directory: `{APP_DIR}`")
-        st.write(f"History File: `{HISTORY_FILE}`")
-        # Download Button for History File
-        history_path = "/mount/src/screeneriq/history.json" # Your specified path
-        
-        if os.path.exists(history_path):
-            with open(history_path, "rb") as f:
-                st.download_button(
-                    label="📥 Download History JSON",
-                    data=f,
-                    file_name="history.json",
-                    mime="application/json"
-                )
-        else:
-            st.info("Note: history.json not found at the specified path.")
-        
-        # if st.button("🗑️ Clear History"):
-        #     if os.path.exists(HISTORY_FILE):
-        #         os.remove(HISTORY_FILE)
-        #         st.success("History cleared.")
-        #         st.rerun()
+        st.write(f"Database File: `{DB_FILE}`")
+
 
 if __name__ == "__main__":
     main()

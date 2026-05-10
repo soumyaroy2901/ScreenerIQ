@@ -4,11 +4,12 @@ Consensus Intelligence is an advanced stock market analytics dashboard built wit
 
 ## 🚀 Key Features
 
-- **Automated Daily Analysis**: Triggered automatically at 5:00 PM IST to capture post-market signals.
+- **Automated Daily Analysis**: Triggered automatically at 5:00 PM IST to capture final post-market settled prices.
+- **Next-Day Prediction Audit**: Measures exactly how yesterday's picks performed in today's market (The "Daily Debrief").
 - **Consensus Engine**: Identifies stocks with the highest conviction based on cross-strategy repetition.
-- **Performance Analytics**: Tracks the real-world success of each strategy (Hit Rate and Average Returns).
-- **Historical Trends**: Visualizes how strategies and specific stocks perform over long time horizons.
-- **Strategy Synergy**: Analyzes which combinations of indicators (e.g., Golden Crossover + Volume Burst) yield the highest returns.
+- **Strategic Leaderboard**: Ranks strategies based on weighted historical success and realized alpha.
+- **Vault Protection**: Safety mechanisms to prevent intraday data from corrupting historical closing records.
+- **Admin Control Center**: Password-protected settings for manual analysis and data management.
 - **Scalable Architecture**: Powered by SQLite for fast, reliable data persistence.
 
 ## 🛠️ Tech Stack
