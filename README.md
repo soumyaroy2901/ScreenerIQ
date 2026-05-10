@@ -24,8 +24,8 @@ Consensus Intelligence is an advanced stock market analytics dashboard built wit
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/ConsensusIntelligence.git
-   cd ConsensusIntelligence
+   git clone https://github.com/yourusername/screeneriq.git
+   cd screeneriq
    ```
 
 2. Install dependencies:
