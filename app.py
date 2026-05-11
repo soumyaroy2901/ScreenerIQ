@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 import json
 
 # Fix pandas future warning
-pd.set_option('future.no_silent_downcasting', True)
+
 
 
 # --- CONFIGURATION ---
@@ -626,7 +626,7 @@ def main():
                             df_input = pd.read_excel(DEFAULT_EXCEL)
                             con_df, perf_df, err = run_full_analysis(df_input)
                             if not err:
-                                t_day, l_day, t_str, l_str = get_last_trading_day()
+                                t_day, is_mo, _, t_str, l_str = get_last_trading_day()
                                 save_date = t_str if t_day else l_str
                                 db.save_daily_report(save_date, con_df, perf_df)
                                 st.success(f"Analysis complete and stored for {save_date}!")
