@@ -1,139 +1,100 @@
-import sqlite3
 import pandas as pd
-import os
+from supabase import create_client, Client
 from datetime import datetime
 
 class DatabaseManager:
-    def __init__(self, db_path="history.db"):
-        self.db_path = db_path
-        self._initialize_db()
-
-    def _get_connection(self):
-        return sqlite3.connect(self.db_path)
-
-    def _initialize_db(self):
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Table for consensus stock picks
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS daily_consensus (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date TEXT NOT NULL,
-                    nsecode TEXT,
-                    name TEXT,
-                    repetition_count INTEGER,
-                    close REAL,
-                    per_chg REAL,
-                    screeners TEXT,
-                    timestamp TEXT
-                )
-            """)
-            
-            # Table for individual screener performance
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS daily_performance (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date TEXT NOT NULL,
-                    screener TEXT,
-                    mean_return REAL,
-                    pick_count INTEGER,
-                    success_rate REAL,
-                    timestamp TEXT
-                )
-            """)
-
-            
-            # Indexing for faster lookups
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_consensus_date ON daily_consensus(date)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_performance_date ON daily_performance(date)")
-            conn.commit()
+    def __init__(self, url, key):
+        self.url = url
+        self.key = key
+        self.supabase: Client = create_client(self.url, self.key)
 
     def save_daily_report(self, date_str, consensus_df, performance_df):
-        """Saves daily analysis results to the database."""
+        """Saves daily analysis results to Supabase."""
         timestamp = datetime.now().isoformat()
         
-        with self._get_connection() as conn:
-            # Check if data already exists for this date and delete to avoid duplicates
-            conn.execute("DELETE FROM daily_consensus WHERE date = ?", (date_str,))
-            conn.execute("DELETE FROM daily_performance WHERE date = ?", (date_str,))
-            
-            # Define allowed columns for consensus
-            con_cols = ['date', 'nsecode', 'name', 'repetition_count', 'close', 'per_chg', 'screeners', 'timestamp']
-            # Define allowed columns for performance
-            perf_cols = ['date', 'screener', 'mean_return', 'pick_count', 'success_rate', 'timestamp']
-
-
-            # Prepare DataFrames for SQL
+        # 1. Clear existing data for this date to avoid duplicates
+        self.supabase.table("daily_consensus").delete().eq("date", date_str).execute()
+        self.supabase.table("daily_performance").delete().eq("date", date_str).execute()
+        
+        # 2. Prepare Consensus Data
+        if not consensus_df.empty:
             con_to_save = consensus_df.copy()
             con_to_save['date'] = date_str
-            con_to_save['timestamp'] = timestamp
+            # Ensure only columns existing in Supabase are sent
+            allowed_con = ['date', 'nsecode', 'name', 'repetition_count', 'close', 'per_chg', 'screeners']
+            con_to_save = con_to_save[[c for c in allowed_con if c in con_to_save.columns]]
             
+            # Convert to list of dicts and insert in chunks (Supabase limit)
+            records = con_to_save.to_dict('records')
+            # Chunking for safety (e.g., 500 records at a time)
+            for i in range(0, len(records), 500):
+                self.supabase.table("daily_consensus").insert(records[i:i+500]).execute()
+
+        # 3. Prepare Performance Data
+        if not performance_df.empty:
             perf_to_save = performance_df.copy()
             perf_to_save['date'] = date_str
-            perf_to_save['timestamp'] = timestamp
             
-            # Handle column name mapping if necessary
-            if 'mean' in perf_to_save.columns:
-                perf_to_save = perf_to_save.rename(columns={'mean': 'mean_return'})
-            if 'count' in perf_to_save.columns:
-                perf_to_save = perf_to_save.rename(columns={'count': 'pick_count'})
-            if 'Screener' in perf_to_save.columns:
-                perf_to_save = perf_to_save.rename(columns={'Screener': 'screener'})
-
-            # Filter only known columns to avoid sqlite3.OperationalError with 'Unnamed: 0' etc.
-            con_to_save = con_to_save[[c for c in con_cols if c in con_to_save.columns]]
-            perf_to_save = perf_to_save[[c for c in perf_cols if c in perf_to_save.columns]]
-
-            # Save to SQL
-            con_to_save.to_sql('daily_consensus', conn, if_exists='append', index=False)
-            perf_to_save.to_sql('daily_performance', conn, if_exists='append', index=False)
-
-            conn.commit()
+            # Mapping names to match Supabase schema
+            if 'mean' in perf_to_save.columns: perf_to_save = perf_to_save.rename(columns={'mean': 'mean_return'})
+            if 'count' in perf_to_save.columns: perf_to_save = perf_to_save.rename(columns={'count': 'pick_count'})
+            if 'Screener' in perf_to_save.columns: perf_to_save = perf_to_save.rename(columns={'Screener': 'screener'})
+            
+            allowed_perf = ['date', 'screener', 'mean_return', 'pick_count', 'success_rate']
+            perf_to_save = perf_to_save[[c for c in allowed_perf if c in perf_to_save.columns]]
+            
+            self.supabase.table("daily_performance").insert(perf_to_save.to_dict('records')).execute()
 
     def get_all_dates(self):
-        """Returns a list of all unique dates in the database."""
-        with self._get_connection() as conn:
-            query = "SELECT DISTINCT date FROM daily_consensus ORDER BY date DESC"
-            return [row[0] for row in conn.execute(query).fetchall()]
+        """Returns a list of all unique dates in Supabase."""
+        # Query the performance table instead of consensus, as it has fewer rows per date
+        response = self.supabase.table("daily_performance").select("date").execute()
+        if not response.data:
+            return []
+        df = pd.DataFrame(response.data)
+        return sorted(df['date'].unique().tolist(), reverse=True)
 
     def get_daily_data(self, date_str):
-        """Fetches both consensus and performance data for a specific date."""
-        with self._get_connection() as conn:
-            con_df = pd.read_sql("SELECT * FROM daily_consensus WHERE date = ?", conn, params=(date_str,))
-            perf_df = pd.read_sql("SELECT * FROM daily_performance WHERE date = ?", conn, params=(date_str,))
+        """Fetches data from Supabase for a specific date."""
+        # Increase limit to 5000 to ensure we get all stocks for the day (usually ~1500)
+        con_resp = self.supabase.table("daily_consensus").select("*").eq("date", date_str).limit(5000).execute()
+        perf_resp = self.supabase.table("daily_performance").select("*").eq("date", date_str).execute()
+        
+        con_df = pd.DataFrame(con_resp.data) if con_resp.data else pd.DataFrame()
+        perf_df = pd.DataFrame(perf_resp.data) if perf_resp.data else pd.DataFrame()
+        
+        # Rename back for app compatibility
+        if not perf_df.empty:
+            perf_df = perf_df.rename(columns={'screener': 'Screener', 'mean_return': 'mean', 'pick_count': 'count'})
             
-            # Rename back for app compatibility
-            if not perf_df.empty:
-                perf_df = perf_df.rename(columns={'screener': 'Screener', 'mean_return': 'mean', 'pick_count': 'count'})
-            
-            return con_df, perf_df
+        return con_df, perf_df
 
     def get_historical_performance(self):
-        """Returns aggregated performance data across all dates using weighted averages."""
-        with self._get_connection() as conn:
-            query = """
-                SELECT 
-                    screener as Screener, 
-                    SUM(success_rate * pick_count) / SUM(pick_count) as avg_success_rate,
-                    SUM(mean_return * pick_count) / SUM(pick_count) as avg_realized_return, 
-                    SUM(pick_count) as total_picks
-                FROM daily_performance
-                GROUP BY screener
-                HAVING total_picks > 0
-                ORDER BY avg_success_rate DESC, avg_realized_return DESC
-            """
-            return pd.read_sql(query, conn)
-
-
-    def get_synergy_data(self, date_str):
-        """Fetches data specifically for synergy analysis."""
-        with self._get_connection() as conn:
-            return pd.read_sql("SELECT nsecode, per_chg, screeners, repetition_count FROM daily_consensus WHERE date = ?", conn, params=(date_str,))
+        """Returns aggregated performance data from Supabase."""
+        # Supabase doesn't support complex aggregations like SUM(x*y)/SUM(y) easily in one select
+        # So we fetch all data and aggregate in Pandas
+        resp = self.supabase.table("daily_performance").select("*").execute()
+        if not resp.data:
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(resp.data)
+        # Weighting logic
+        df['weighted_success'] = df['success_rate'] * df['pick_count']
+        df['weighted_return'] = df['mean_return'] * df['pick_count']
+        
+        agg = df.groupby('screener').agg({
+            'weighted_success': 'sum',
+            'weighted_return': 'sum',
+            'pick_count': 'sum'
+        })
+        
+        agg['avg_success_rate'] = agg['weighted_success'] / agg['pick_count']
+        agg['avg_realized_return'] = agg['weighted_return'] / agg['pick_count']
+        
+        return agg.reset_index().rename(columns={'screener': 'Screener', 'pick_count': 'total_picks'}).sort_values('avg_success_rate', ascending=False)
 
     def clear_all_history(self):
-        """Wipes the database tables."""
-        with self._get_connection() as conn:
-            conn.execute("DELETE FROM daily_consensus")
-            conn.execute("DELETE FROM daily_performance")
-            conn.commit()
+        """Wipes the Supabase tables (Use with caution)."""
+        # Supabase requires a filter for deletes usually, or use a RPC
+        self.supabase.table("daily_consensus").delete().neq("id", -1).execute()
+        self.supabase.table("daily_performance").delete().neq("id", -1).execute()

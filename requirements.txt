@@ -5,5 +5,4 @@ beautifulsoup4
 pytz
 plotly
 openpyxl
-selenium
-webdriver-manager
+supabase
