@@ -188,7 +188,8 @@ def calculate_prediction_success(today_str):
     screener_results = []
     # We need to explode the screeners list from yesterday
     for _, row in merged.iterrows():
-        sc_list = str(row['screeners']).split(', ')
+        # Robust split for complex screener names
+        sc_list = re.split(r',\s*(?![^()]*\))', str(row['screeners']))
         for sc in sc_list:
             screener_results.append({
                 "Screener": sc,
@@ -429,7 +430,7 @@ def main():
                 st.sidebar.error(f"❌ Analysis failed: {e}")
 
     st.sidebar.divider()
-    page = st.sidebar.radio("Navigate", ["Command Desk", "Performance Analytics", "Historical Trends", "Settings"])
+    page = st.sidebar.radio("Navigate", ["Command Desk", "Screener Data", "Performance Analytics", "Historical Trends", "Settings"])
     
     # --- PAGE: COMMAND DESK ---
     if page == "Command Desk":
@@ -484,6 +485,71 @@ def main():
             
             filtered_con = con_df[con_df['repetition_count'] >= 3]
             st.dataframe(filtered_con[display_cols], width='stretch', height=600, hide_index=True)
+
+    elif page == "Screener Data":
+        st.title("🔍 Screener Data Lookup")
+        
+        if not all_dates:
+            st.info("No analysis history found in the vault.")
+        else:
+            col1, col2 = st.columns(2)
+            with col1:
+                selected_date = st.selectbox("Select Analysis Date", all_dates)
+            
+            # Fetch data for the date to get available screeners
+            con_df, _ = db.get_daily_data(selected_date)
+            
+            if not con_df.empty:
+                # Extract unique screeners from the comma-separated strings
+                all_screeners = []
+                for s in con_df['screeners'].dropna():
+                    # Robust split: Only split by commas NOT inside parentheses
+                    # Regex explanation: split by comma if not followed by an odd number of closing parens
+                    # Simpler: Use regex to find all comma-separated values while keeping parens together
+                    parts = re.split(r',\s*(?![^()]*\))', str(s))
+                    all_screeners.extend([p.strip() for p in parts if p.strip()])
+                
+                unique_screeners = sorted(list(set(all_screeners)))
+                
+                with col2:
+                    selected_screener = st.selectbox("Select Screener", unique_screeners)
+                
+                # Filter stocks where the selected screener is part of the screeners list
+                # Use regex=False for simple substring matching
+                filtered_stocks = con_df[con_df['screeners'].str.contains(selected_screener, regex=False, na=False)].copy()
+                
+                st.subheader(f"Stocks identified by '{selected_screener}' on {selected_date}")
+                
+                # Display metrics for the filtered set
+                avg_chg = filtered_stocks['per_chg'].mean()
+                count = len(filtered_stocks)
+                
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Stock Count", count)
+                m2.metric("Avg Day Change", f"{avg_chg:.2f}%")
+                m3.metric("Highest Count", filtered_stocks['repetition_count'].max())
+
+                st.dataframe(filtered_stocks[['nsecode', 'name', 'close', 'per_chg', 'repetition_count', 'screeners']], 
+                             use_container_width=True, hide_index=True)
+                
+                st.divider()
+                st.subheader("🏁 Live Performance Audit")
+                st.info("Check how these specific stocks are performing right now compared to their recommended price.")
+                
+                if st.button("🚀 Fetch Current Prices (Live LTP)"):
+                    with st.spinner(f"Auditing {count} stocks..."):
+                        # Extract codes
+                        symbols = filtered_stocks['nsecode'].tolist()
+                        
+                        # Use internal logic to fetch LTP
+                        # This would typically call a tool or API. 
+                        # For the Streamlit app, we would need to implement a fetching logic.
+                        # Since we are in the script, I'll simulate or add a placeholder 
+                        # or better, use the logic from run_full_analysis if possible.
+                        # But wait, we have access to growwmcp via tool calls, but the APP itself doesn't.
+                        # However, for the user's app, they usually use some scraping or API.
+                        # I'll add a section that explains this requires an API key or scraper.
+                        st.warning("Live audit requires a live data provider (like Groww/NSE scraping). Currently showing historical snapshot.")
 
     elif page == "Performance Analytics":
         st.title("🎯 Strategy Performance Center")
@@ -642,6 +708,22 @@ def main():
                     st.rerun()
             elif admin_pwd:
                 st.error("Access Denied: Incorrect Password")
+
+        st.divider()
+        st.subheader("💾 Data Backup & Protection")
+        st.warning("⚠️ **Persistence Notice**: If you are hosted on Streamlit Cloud, the `history.db` file is temporary. Download a backup periodically to keep your data safe.")
+        
+        if os.path.exists(DB_FILE):
+            with open(DB_FILE, "rb") as f:
+                st.download_button(
+                    label="📥 Download Database Backup (SQLite)",
+                    data=f,
+                    file_name=f"consensus_vault_{datetime.now().strftime('%Y%m%d')}.db",
+                    mime="application/octet-stream",
+                    help="Download the entire historical database to your local machine."
+                )
+        else:
+            st.error("Database file not found.")
 
         st.divider()
         st.subheader("📂 Data Vault Information")
