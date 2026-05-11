@@ -282,13 +282,13 @@ def run_full_analysis(df_input):
     status_text = st.empty()
     
     total = len(df_input)
-    for index, row in df_input.iterrows():
+    for count, (index, row) in enumerate(df_input.iterrows(), 1):
         name = str(row['SCAN STOCKS']).strip()
         url = str(row['LINK']).strip()
         clause = str(row.get('Scan Clause', '')).strip()
         
-        status_text.text(f"Scanning [{index+1}/{total}]: {name}...")
-        progress_bar.progress((index + 1) / total)
+        status_text.text(f"Scanning [{count}/{total}]: {name}...")
+        progress_bar.progress(count / total)
         
         if not clause or clause == 'nan' or len(clause) < 10:
             clause = extract_scan_clause(url, session)
