@@ -414,7 +414,7 @@ def main():
                 if os.path.exists(DEFAULT_EXCEL):
                     df_input = pd.read_excel(DEFAULT_EXCEL)
                     # Deduplicate screeners if any
-                    df_input = df_input.drop_duplicates(subset=['url'])
+                    df_input = df_input.drop_duplicates(subset=['LINK'])
                     
                     con_df, perf_df, err = run_full_analysis(df_input)
                     if not err:
