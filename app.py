@@ -348,41 +348,27 @@ def run_full_analysis(df_input):
 # --- STREAMLIT UI ---
 def main():
     st.set_page_config(page_title="Commander Desk v5", page_icon="📡", layout="wide")
-    def get_last_trading_day():
-        now = datetime.now(IST)
-        today_str = now.strftime('%Y-%m-%d')
-        today_weekday = now.weekday() # 0=Mon, 6=Sun
-        
-        is_trading_day = (today_weekday < 5) and (today_str not in NSE_HOLIDAYS_2026)
-        
-        # Time check (9:15 AM to 3:30 PM)
-        market_open_time = now.replace(hour=9, minute=15, second=0, microsecond=0)
-        market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
-        is_market_open = is_trading_day and (market_open_time <= now <= market_close_time)
-
-        # Get last trading day by looking backwards
-        search_date = now - timedelta(days=1)
-        while True:
-            sw = search_date.weekday()
-            sd_str = search_date.strftime('%Y-%m-%d')
-            if sw < 5 and sd_str not in NSE_HOLIDAYS_2026:
-                last_day_str = sd_str
-                break
-            search_date -= timedelta(days=1)
-            
-        # If today is a trading day and it's after market close, today is the primary display date
-        if is_trading_day and now.time() >= datetime.strptime("15:30", "%H:%M").time():
-            return True, is_market_open, today_str, today_str, last_day_str
-        
-        return is_trading_day, is_market_open, last_day_str, today_str, last_day_str
-    
     apply_custom_styles()
     
     now = get_current_ist_time()
     today_str = now.strftime("%Y-%m-%d")
     all_dates = db.get_all_dates()
     
-    is_trading_day, is_market_open, last_trading_day_str, today_str, _ = get_last_trading_day()
+    # Determine trading day status using module-level helpers
+    _is_trading_day = is_trading_day(now)
+    _market_open_time = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    _market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    _is_market_open = _is_trading_day and (_market_open_time <= now <= _market_close_time)
+    _last_trading_day_dt = get_last_trading_day(now)
+    last_trading_day_str = _last_trading_day_dt.strftime('%Y-%m-%d')
+
+    # If today is a trading day and after close, use today as the primary display date
+    if _is_trading_day and now.time() >= datetime.strptime("15:30", "%H:%M").time():
+        is_market_open = _is_market_open
+    else:
+        today_str = last_trading_day_str
+        is_market_open = _is_market_open
+    is_trading_day_flag = _is_trading_day
     
     # --- SIDEBAR ---
     st.sidebar.title("📡 CONTROL CENTER")
@@ -397,7 +383,7 @@ def main():
     if today_str in all_dates:
         analysis_status = "READY"
         status_color = "status-ready"
-    elif not is_trading_day:
+    elif not is_trading_day_flag:
         analysis_status = "NSE HOLIDAY / WEEKEND"
         status_color = "status-pending"
     else:
@@ -409,7 +395,7 @@ def main():
 
     
     # Check for Auto-Trigger (Double-lock to prevent race conditions across tabs)
-    if auto_trigger and is_trading_day and analysis_status == "PENDING" and now.hour >= 17:
+    if auto_trigger and is_trading_day_flag and analysis_status == "PENDING" and now.hour >= 17:
         # Re-verify status from DB to ensure another tab didn't just finish it
         if today_str not in db.get_all_dates():
             st.sidebar.warning("🕒 It's past 5 PM IST. Auto-triggering analysis...")
@@ -421,7 +407,7 @@ def main():
                     
                     con_df, perf_df, err = run_full_analysis(df_input)
                     if not err:
-                        save_date = today_str if is_trading_day else last_trading_day_str
+                        save_date = today_str if is_trading_day_flag else last_trading_day_str
                         db.save_daily_report(save_date, con_df, perf_df)
                         st.rerun()
                     else:
@@ -445,7 +431,7 @@ def main():
             if all_dates:
                 display_date = all_dates[0]
                 is_fallback = True
-                if not is_trading_day:
+                if not is_trading_day_flag:
                     if last_trading_day_str not in all_dates:
                         st.warning(f"⚠️ Missing data for the last trading day (**{last_trading_day_str}**). Run analysis now to capture results.")
                     st.info(f"🏖️ Market is closed today ({today_str}). Showing latest available data from **{display_date}**.")
@@ -701,7 +687,7 @@ def main():
                     # Vault Protection: Only block during live market hours (09:15 → 15:30 IST)
                     _market_open  = datetime.strptime("09:15", "%H:%M").time()
                     _market_close = datetime.strptime("15:30", "%H:%M").time()
-                    _is_live_market = is_trading_day and (_market_open <= now.time() <= _market_close)
+                    _is_live_market = is_trading_day_flag and (_market_open <= now.time() <= _market_close)
                     if _is_live_market:
                         st.error("🛑 Vault Protection: Cannot save during live market hours (09:15–15:30 IST). This prevents intraday noise from corrupting your historical intelligence.")
 
@@ -718,10 +704,10 @@ def main():
                                 # Before market opens (midnight → 09:14), Chartink shows last session data
                                 _after_close = _now.time() >= _market_close_t
                                 _before_open = _now.time() < _market_open_t
-                                if is_trading_day and _after_close:
+                                if is_trading_day_flag and _after_close:
                                     save_date = _today_str          # e.g. ran at 5 PM → save as today
                                 else:
-                                    save_date = get_last_trading_day(_now - timedelta(days=1)).strftime('%Y-%m-%d') if _before_open else _today_str
+                                    save_date = get_last_trading_day(_now).strftime('%Y-%m-%d') if _before_open else _today_str
 
                                 db.save_daily_report(save_date, con_df, perf_df)
                                 st.success(f"Analysis complete and stored for {save_date}!")
