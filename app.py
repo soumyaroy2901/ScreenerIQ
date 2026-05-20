@@ -660,15 +660,24 @@ def main():
             st.divider()
             st.subheader("🧬 Multi-Strategy Consistency Tracker")
             
-            with db._get_connection() as conn:
-                big_perf = pd.read_sql("SELECT * FROM daily_performance", conn)
-                big_perf = big_perf.rename(columns={'screener': 'Screener', 'mean_return': 'mean', 'date': 'Date'})
+            with st.spinner("Loading all strategy data..."):
+                _perf_resp = db.supabase.table("daily_performance").select("date,screener,mean_return").execute()
+                if _perf_resp.data:
+                    big_perf = pd.DataFrame(_perf_resp.data)
+                    big_perf = big_perf.rename(columns={'screener': 'Screener', 'mean_return': 'mean', 'date': 'Date'})
+                else:
+                    big_perf = pd.DataFrame(columns=['Date', 'Screener', 'mean'])
+
 
             all_strategies = sorted(big_perf['Screener'].unique())
-            # Default to top 5 historical strategies
-            default_strats = historical_report.head(5)['Screener'].tolist() if historical_report is not None else []
+            # Default to top 5 historical strategies (only those actually present in big_perf)
+            if historical_report is not None:
+                default_strats = [s for s in historical_report.head(5)['Screener'].tolist() if s in all_strategies]
+            else:
+                default_strats = []
             
             target_strategies = st.multiselect("Pick Strategies to Compare Trend", all_strategies, default=default_strats)
+
             
             if target_strategies:
                 strat_trend = big_perf[big_perf['Screener'].isin(target_strategies)].sort_values('Date')
@@ -689,16 +698,31 @@ def main():
             if admin_pwd == "Trade@123":
                 st.divider()
                 if st.button("🚀 Trigger Full Analysis"):
-                    # Vault Protection Check
-                    if is_trading_day and now.time() < datetime.strptime("15:30", "%H:%M").time():
-                        st.error("🛑 Vault Protection: You cannot save analysis to the database during live market hours (before 15:30 IST). This prevents intraday noise from corrupting your historical intelligence.")
+                    # Vault Protection: Only block during live market hours (09:15 → 15:30 IST)
+                    _market_open  = datetime.strptime("09:15", "%H:%M").time()
+                    _market_close = datetime.strptime("15:30", "%H:%M").time()
+                    _is_live_market = is_trading_day and (_market_open <= now.time() <= _market_close)
+                    if _is_live_market:
+                        st.error("🛑 Vault Protection: Cannot save during live market hours (09:15–15:30 IST). This prevents intraday noise from corrupting your historical intelligence.")
+
                     elif os.path.exists(DEFAULT_EXCEL):
                         with st.spinner("Executing manual scan..."):
                             df_input = pd.read_excel(DEFAULT_EXCEL)
                             con_df, perf_df, err = run_full_analysis(df_input)
                             if not err:
-                                t_day, is_mo, _, t_str, l_str = get_last_trading_day()
-                                save_date = t_str if t_day else l_str
+                                _now = datetime.now(IST)
+                                _today_str = _now.strftime('%Y-%m-%d')
+                                _market_open_t  = datetime.strptime("09:15", "%H:%M").time()
+                                _market_close_t = datetime.strptime("15:30", "%H:%M").time()
+                                # Save as TODAY only if market has already closed for today
+                                # Before market opens (midnight → 09:14), Chartink shows last session data
+                                _after_close = _now.time() >= _market_close_t
+                                _before_open = _now.time() < _market_open_t
+                                if is_trading_day and _after_close:
+                                    save_date = _today_str          # e.g. ran at 5 PM → save as today
+                                else:
+                                    save_date = get_last_trading_day(_now - timedelta(days=1)).strftime('%Y-%m-%d') if _before_open else _today_str
+
                                 db.save_daily_report(save_date, con_df, perf_df)
                                 st.success(f"Analysis complete and stored for {save_date}!")
                                 st.rerun()
